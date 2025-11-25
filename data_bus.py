@@ -3,27 +3,28 @@ data_bus.py
 
 Thread-safe shared data hub for the detection unit on Raspberry Pi.
 
-Core shared data (explicitly defined here):
-    - image_queue           : raw frames from read_camera.py -> yolo_detector.py
-    - detect_queue          : detection results from yolo_detector.py ->
-                              decision_logic.py / logger.py / lora_comm.py / http_server.py
-    - processed_image_queue : processed / annotated frames from yolo_detector.py
-                              (one-to-one with detect_queue items, and also
-                               carries detection data for UI)
-    - motor_location        : current motor position/state from motor_controller.py
-    - deter_flag            : global deterrence flag controlled by decision_logic.py
-    - error_log             : error / health events from all modules -> logger.py
+Core responsibilities:
+    - Own and expose the main shared queues:
+        * image_queue            : raw frames (read_camera.py -> yolo_detector.py)
+        * detect_queue           : detection results (yolo_detector.py -> decision_logic.py / logger.py / lora_comm.py / http_server.py)
+        * processed_image_queue  : processed / annotated frames for UI / HTTP
+        * error_log              : structured error entries for logger / watchdog
 
-Additional, module-specific resources can be registered via:
-    DataBus.get_or_create("module.key", factory)
+    - Provide generic queue helpers (for both core and module-specific queues):
+        * queue_put(...)
+        * queue_get(...)
+        * drain_queue(...)
+        * get_latest_from_queue(...)
 
-Generic queue helpers (for core + private queues):
-    - queue_put(queue, item, drop_oldest_if_full=False)
-    - queue_get(queue, timeout=None)
-    - drain_queue(queue, max_items=None)
-    - get_latest_from_queue(queue)
+    - Provide a single semantic helper that keeps detection and processed-image
+      queues aligned:
+        * push_detection_with_image(...)
 
-All queues can be bounded (maxsize > 0) or unbounded (maxsize == 0).
+    - Maintain shared state:
+        * motor_location (dict)
+        * deter_flag (bool)
+        * generic registry for module-specific resources
+        * per-module health info and snapshots for watchdog / http_server
 """
 
 from __future__ import annotations
@@ -93,6 +94,11 @@ class DataBus:
     Central hub for all shared data.
 
     One DataBus instance should be created in main.py and passed to all modules.
+    Modules are expected to:
+        - use the exposed queues directly (image_queue, detect_queue, etc.),
+        - use the generic queue helpers for consistent behaviour,
+        - optionally use push_detection_with_image() when they need detection
+          and processed-image queues to stay aligned.
     """
 
     def __init__(
@@ -231,123 +237,8 @@ class DataBus:
         return latest if got_any else None
 
     # ------------------------------------------------------------------
-    # Image queue API (bounded)
+    # Detection + processed-image paired push helper
     # ------------------------------------------------------------------
-
-    def push_image(
-        self,
-        frame: Any,
-        meta: Optional[Dict[str, Any]] = None,
-        drop_oldest_if_full: bool = True,
-    ) -> None:
-        """
-        Push a new raw image into image_queue.
-
-        Typically we prefer fresh frames here, so drop_oldest_if_full defaults
-        to True.
-        """
-        if meta is None:
-            meta = {}
-        item = ImageItem(frame=frame, timestamp=time.time(), meta=meta)
-        self.queue_put(self.image_queue, item, drop_oldest_if_full=drop_oldest_if_full)
-
-    def get_image(self, timeout: Optional[float] = None) -> Optional[ImageItem]:
-        """
-        Get the next raw image from image_queue.
-        """
-        item = self.queue_get(self.image_queue, timeout=timeout)
-        return item  # type: ignore[return-value]
-
-    # ------------------------------------------------------------------
-    # Processed-image queue API (bounded)
-    # ------------------------------------------------------------------
-
-    def push_processed_image(
-        self,
-        frame: Any,
-        boxes: Any,
-        scores: Any,
-        labels: Any,
-        timestamp: Optional[float] = None,
-        meta: Optional[Dict[str, Any]] = None,
-        drop_oldest_if_full: bool = False,
-    ) -> None:
-        """
-        Push a processed / annotated image into processed_image_queue.
-
-        This is typically called from yolo_detector.py after running
-        detection and drawing boxes on the frame.
-        """
-        if meta is None:
-            meta = {}
-        if timestamp is None:
-            timestamp = time.time()
-
-        item = ProcessedImageItem(
-            frame=frame,
-            boxes=boxes,
-            scores=scores,
-            labels=labels,
-            timestamp=timestamp,
-            meta=meta,
-        )
-        self.queue_put(
-            self.processed_image_queue,
-            item,
-            drop_oldest_if_full=drop_oldest_if_full,
-        )
-
-    def get_processed_image(
-        self, timeout: Optional[float] = None
-    ) -> Optional[ProcessedImageItem]:
-        """
-        Get the next processed image from processed_image_queue (FIFO).
-        """
-        item = self.queue_get(self.processed_image_queue, timeout=timeout)
-        return item  # type: ignore[return-value]
-
-    # ------------------------------------------------------------------
-    # Detection queue API (bounded)
-    # ------------------------------------------------------------------
-
-    def push_detection(
-        self,
-        boxes: Any,
-        scores: Any,
-        labels: Any,
-        meta: Optional[Dict[str, Any]] = None,
-        drop_oldest_if_full: bool = False,
-    ) -> None:
-        """
-        Push a detection result into detect_queue.
-
-        If you also have a processed frame, prefer push_detection_with_image()
-        to keep detect_queue and processed_image_queue logically aligned.
-        """
-        if meta is None:
-            meta = {}
-
-        item = DetectionItem(
-            boxes=boxes,
-            scores=scores,
-            labels=labels,
-            timestamp=time.time(),
-            meta=meta,
-        )
-        self.queue_put(
-            self.detect_queue,
-            item,
-            drop_oldest_if_full=drop_oldest_if_full,
-        )
-
-    def get_detection(
-        self, timeout: Optional[float] = None
-    ) -> Optional[DetectionItem]:
-        """
-        Get the next detection result from detect_queue.
-        """
-        item = self.queue_get(self.detect_queue, timeout=timeout)
-        return item  # type: ignore[return-value]
 
     def push_detection_with_image(
         self,
@@ -368,6 +259,10 @@ class DataBus:
         processed_image_queue carries copies of detection data so that
         http_server can display bounding boxes / labels without consuming
         detect_queue.
+
+        This is the only semantic helper that couples two queues; all other
+        type-specific push/get logic is expected to live in the respective
+        modules.
         """
         if meta is None:
             meta = {}
@@ -444,44 +339,6 @@ class DataBus:
         """
         with self._deter_flag_lock:
             return self._deter_flag
-
-    # ------------------------------------------------------------------
-    # Error log API (bounded queue)
-    # ------------------------------------------------------------------
-
-    def log_error(
-        self,
-        module: str,
-        level: str,
-        message: str,
-        details: Optional[str] = None,
-        drop_oldest_if_full: bool = True,
-    ) -> None:
-        """
-        Push an error log entry into error_log.
-
-        drop_oldest_if_full=True avoids unbounded growth of the error queue.
-        """
-        entry = ErrorEntry(
-            timestamp=time.time(),
-            module=module,
-            level=level.upper(),
-            message=message,
-            details=details,
-        )
-
-        self.queue_put(
-            self.error_log,
-            entry,
-            drop_oldest_if_full=drop_oldest_if_full,
-        )
-
-    def get_error(self, timeout: Optional[float] = None) -> Optional[ErrorEntry]:
-        """
-        Get the next error log entry from error_log.
-        """
-        item = self.queue_get(self.error_log, timeout=timeout)
-        return item  # type: ignore[return-value]
 
     # ------------------------------------------------------------------
     # Generic registry for module-specific resources
