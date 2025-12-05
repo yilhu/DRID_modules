@@ -104,6 +104,7 @@ SWEEP_ANGLE_TOTAL = 120 # Total scan angle
 # Communication Parameters
 SERIAL_PORT = '/dev/serial0' # LoRa Serial Port Address
 BAUD_RATE   = 9600           # LoRa Baud Rate
+```
 
 ## 📁 Directory Structure
 
