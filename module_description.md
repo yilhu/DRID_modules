@@ -11,16 +11,15 @@ Ensure the Raspberry Pi has the following Python libraries installed:
 
 ```bash
 pip install opencv-python ultralytics flask RPi.GPIO pyserial numpy
+```
 
 ### 2. Run Integration Test
 The system provides an integration debug script containing all modules. Before running, ensure hardware connections are correct (see Hardware section below).
 
 ```bash
 python3 A_good_debug_everything_motorwithlora.py
+```
 
-Here is the third item of the **Quick Start** section:
-
-```markdown
 ### 3. Access Dashboard
 Once the system is running, access the following URL in a browser on the same LAN:
 `http://<RaspberryPi_IP>:5000`
