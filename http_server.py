@@ -1,302 +1,371 @@
 """
-http_server.py (Flask version)
+http_server.py (Flask version) - Dashboard Optimized
 
-HTTP server module for exposing DataBus state on 127.0.0.1:5000.
-
-- Runs as a BaseModule (thread) and periodically pulls selected values
-  / latest queue items from the shared DataBus into an internal snapshot.
-- Starts a Flask-based HTTP server (in a separate thread) that serves
-  the latest snapshot to external clients.
-
-Endpoints:
-    GET /status
-        -> JSON with latest snapshot (motor state, flags, detections, etc.)
-
-    GET /image
-        -> latest JPEG frame (if available), or 404 if none.
+HTTP server module for exposing DataBus state and processed images.
+Features:
+- Live Dashboard: Combines Video Stream + Real-time JSON Status.
+- Reads ALL configuration from DataBus.get_state("config").
+- Uses unified DataBus.get_state() for thread-safe access to shared state.
+- Reads latest image from DataBus registry ("latest_processed_image_item").
 """
 
 from __future__ import annotations
 
 import json
-import queue
 import threading
 import time
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple, List
+from datetime import datetime
 
-try:
-    import cv2  # For JPEG encoding of frames
-except ImportError:
-    cv2 = None  # type: ignore
-
-from flask import Flask, jsonify, Response
+# Import Flask components
+from flask import Flask, Response, render_template_string
 from werkzeug.serving import make_server
 
-from data_bus import BaseModule, DataBus, get_latest_from_queue  # adjust import if needed
+# Conditional imports for image processing
+try:
+    import cv2  # For JPEG encoding of frames
+    import numpy as np
+except ImportError:
+    cv2 = None  # type: ignore
+    np = None   # type: ignore
+
+# Import necessary components from the common modules
+from data_bus import DataBus, ProcessedImageItem, DEFAULT_CONFIG_STRUCTURE
+from module_base import BaseModule
 
 
 # ---------------------------------------------------------------------------
-# Configuration
+# Helpers for JSON Serialization
 # ---------------------------------------------------------------------------
 
-HOST = "127.0.0.1"
-PORT = 5000
-POLL_INTERVAL = 1.0  # seconds, can be overridden via ctor
-
-
-# Which keys from DataBus to publish, and how.
-# "snapshot_key": ("mode", "databus_key")
-#
-# Supported modes:
-#   - "value"             : read a plain value from DataBus
-#   - "queue_latest"      : get latest item from a queue
-#   - "queue_latest_image": get latest frame from a queue, encode as JPEG;
-#                           snapshot only stores metadata, image served via /image
-EXPORT_CONFIG: Dict[str, Tuple[str, str]] = {
-    "motor_location": ("value", "motor_location"),
-    "deter_flag": ("value", "deter_flag"),
-    "latest_detection": ("queue_latest", "detect_queue"),
-    "processed_frame": ("queue_latest_image", "processed_image_queue"),
-    # Example if watchdog writes aggregated health info:
-    # "health": ("value", "watchdog.health_dict"),
-}
-
+def json_default(value: Any) -> Any:
+    """Helper to serialize complex types (like numpy arrays) into JSON."""
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, bytes):
+        return value.decode('utf-8', errors='ignore')
+    return repr(value)
 
 # ---------------------------------------------------------------------------
-# JSON utilities
-# ---------------------------------------------------------------------------
-
-def json_default(obj: Any) -> Any:
-    """
-    Fallback JSON serializer for non-standard objects.
-    """
-    try:
-        import numpy as np  # type: ignore
-        if isinstance(obj, np.ndarray):
-            return obj.tolist()
-    except Exception:
-        pass
-
-    return str(obj)
-
-
-# ---------------------------------------------------------------------------
-# HttpServerModule
+# HTTP Server Module
 # ---------------------------------------------------------------------------
 
 class HttpServerModule(BaseModule):
     """
-    Module that periodically pulls data from DataBus into a snapshot and
-    exposes that snapshot via a small Flask-based HTTP server.
-
-    Typical use:
-
-        data_bus = DataBus()
-        http_server = HttpServerModule(
-            data_bus=data_bus,
-            host="127.0.0.1",
-            port=5000,
-            poll_interval=1.0,
-        )
-        http_server.start()
-
-    Then on the Pi:
-        curl http://127.0.0.1:5000/status
-        curl http://127.0.0.1:5000/image > latest.jpg
+    A module that runs an HTTP server (Flask) in a separate thread.
+    Serves a unified dashboard with MJPEG stream and AJAX-updated status.
     """
+    
+    # Configuration prefix to match keys in DataBus.config
+    CONFIG_PREFIX = "http_server"
 
     def __init__(
         self,
         data_bus: DataBus,
-        name: str = "http_server",
-        host: str = HOST,
-        port: int = PORT,
-        poll_interval: float = POLL_INTERVAL,
-        export_config: Optional[Dict[str, Tuple[str, str]]] = None,
+        name: str = "Server",
         daemon: bool = True,
-    ) -> None:
-        super().__init__(name=name, data_bus=data_bus, daemon=daemon)
-        self.host = host
-        self.port = port
-        self.poll_interval = poll_interval
-        self.export_config = export_config or dict(EXPORT_CONFIG)
+        **kwargs: Any,
+    ):
+        
+        self.config_prefix = self.CONFIG_PREFIX
+        
+        # Get the unified configuration dictionary
+        cfg: Dict[str, Any] = data_bus.get_state("config", {})
+        
+        def get_cfg(key: str, default: Any = None) -> Any:
+            """Retrieves a configuration value using the module's prefix."""
+            full_key = f"{self.config_prefix}_{key}"
+            return cfg.get(full_key, default)
 
-        # Snapshot of values exposed via /status
-        self._snapshot_lock = threading.Lock()
-        self._snapshot: Dict[str, Any] = {}
+        # 1. BaseModule Configuration
+        # Handle priority: kwargs > config > default
+        if "max_consecutive_fail" in kwargs:
+            max_fail = kwargs.pop("max_consecutive_fail")
+        else:
+            default_max_fail = DEFAULT_CONFIG_STRUCTURE.get(f"{self.CONFIG_PREFIX}_max_consecutive_fail", 5)
+            max_fail = get_cfg("max_consecutive_fail", default_max_fail)
+        
+        super().__init__(
+            name=name, 
+            data_bus=data_bus, 
+            daemon=daemon,
+            max_consecutive_fail=max_fail,
+            **kwargs
+        )
+        
+        # 2. HttpServer Specific Configuration
+        self.host: str = get_cfg("host", "127.0.0.1")
+        self.port: int = int(get_cfg("port", 5000))
+        self.poll_interval: float = float(get_cfg("poll_interval", 1.0))
+        self.export_keys: List[str] = get_cfg("export_config_keys", ["motor_location", "deter_flag"])
 
-        # Latest encoded JPEG frame (served via /image)
-        self._image_lock = threading.Lock()
-        self._latest_image_jpeg: Optional[bytes] = None
-        self._latest_image_ts: Optional[float] = None
-
-        # Flask app & WSGI server
+        # --- Internal Runtime State ---
         self.app = Flask(__name__)
-        self._setup_routes()
-        self._server = None
+        self._server: Optional[make_server] = None
         self._server_thread: Optional[threading.Thread] = None
 
-    # ------------------------------------------------------------------ #
-    # Flask routes
-    # ------------------------------------------------------------------ #
+        self._snapshot: Dict[str, Any] = {}
+        self._snapshot_lock = threading.Lock()
+        
+        self._latest_image_jpeg: Optional[bytes] = None
+        self._latest_image_meta: Dict[str, Any] = {}
+        self._image_lock = threading.Lock()
 
-    def _setup_routes(self) -> None:
-        module = self  # capture self for inner functions
-
-        @self.app.route("/", methods=["GET"])
-        @self.app.route("/status", methods=["GET"])
-        @self.app.route("/state", methods=["GET"])
-        def status() -> Any:
-            snapshot = module.get_snapshot()
-            out = {
-                "server_time": time.time(),
-                "data": snapshot,
-            }
-            return module._json_response(out, status=200)
-
-        @self.app.route("/image", methods=["GET"])
-        def image() -> Any:
-            image_bytes, ts = module.get_latest_image()
-            if image_bytes is None:
-                out = {"error": "no_image"}
-                return module._json_response(out, status=404)
-            return Response(image_bytes, mimetype="image/jpeg")
+        # Bind Flask routes
+        self.app.add_url_rule("/status", view_func=self._handle_status, methods=["GET"])
+        self.app.add_url_rule("/image", view_func=self._handle_image, methods=["GET"])
+        self.app.add_url_rule("/stream", view_func=self._handle_stream, methods=["GET"])
+        self.app.add_url_rule("/", view_func=self._handle_home, methods=["GET"])
 
     # ------------------------------------------------------------------ #
-    # BaseModule hooks
+    # Lifecycle
     # ------------------------------------------------------------------ #
 
     def setup(self) -> None:
-        """
-        Start the Flask-based HTTP server in a separate thread.
-        """
-        self._server = make_server(self.host, self.port, self.app)
-        # Optional: tune timeout if needed (default is fine for low load)
-        # self._server.timeout = 1.0
-
-        self._server_thread = threading.Thread(
-            target=self._server.serve_forever,
-            name=f"{self.name}_flask_thread",
-            daemon=True,
-        )
+        """Initialize and start the WSGI server."""
+        print(f"[{self.name}] Setup: Starting HTTP server on http://{self.host}:{self.port}...")
+        self._server = make_server(self.host, self.port, self.app, threaded=True)
+        self._server_thread = threading.Thread(target=self._server.serve_forever, daemon=True)
         self._server_thread.start()
-
-    def step(self) -> None:
-        """
-        Periodically refresh the internal snapshot from DataBus.
-
-        This method is called in a loop by BaseModule.run().
-        """
-        t0 = time.time()
         self._update_snapshot()
 
-        # Sleep until next polling time, but remain responsive to stop()
-        while True:
-            if self.should_stop():
-                break
-            elapsed = time.time() - t0
-            remaining = self.poll_interval - elapsed
-            if remaining <= 0:
-                break
-            time.sleep(min(0.1, remaining))
-
+    def step(self) -> None:
+        """Update snapshot and wait for events."""
+        self._update_snapshot()
+        # Wait efficiently for state changes or timeout
+        self.data_bus.wait_for_state_change(timeout=self.poll_interval)
+        
     def teardown(self) -> None:
-        """
-        Stop the HTTP server gracefully.
-        """
-        if self._server is not None:
-            try:
-                self._server.shutdown()
-            except Exception:
-                pass
+        """Stop the server."""
+        if self._server:
+            self._server.shutdown()
+        if self._server_thread and self._server_thread.is_alive():
+            self._server_thread.join(timeout=2)
 
     # ------------------------------------------------------------------ #
-    # Snapshot & image helpers
+    # Data Logic
     # ------------------------------------------------------------------ #
 
     def _update_snapshot(self) -> None:
-        """
-        Read configured items from DataBus and update the snapshot and
-        latest image buffer (if configured).
-        """
+        """Update the internal state snapshot from DataBus."""
         new_snapshot: Dict[str, Any] = {}
-        new_snapshot["snapshot_time"] = time.time()
+        
+        # 1. Health & Configured Keys
+        new_snapshot["health"] = self.data_bus.get_module_health_snapshot()
+        for key in self.export_keys:
+            new_snapshot[key] = self.data_bus.get_state(key)
 
-        for snapshot_key, (mode, databus_key) in self.export_config.items():
-            try:
-                if mode == "value":
-                    value = self.data_bus.get_or_create(databus_key, lambda: None)
-                    new_snapshot[snapshot_key] = value
+        # 2. Latest Image Logic
+        latest_item: Optional[ProcessedImageItem] = self.data_bus.get_state("latest_processed_image_item", None)
+        
+        if latest_item and cv2 is not None:
+            jpeg_bytes = self._generate_jpeg(latest_item.frame)
+            image_meta = {
+                "timestamp": latest_item.timestamp,
+                "width": latest_item.frame.shape[1],
+                "height": latest_item.frame.shape[0],
+                "detection_count": len(latest_item.boxes),
+                "meta": latest_item.meta,
+            }
+            if jpeg_bytes:
+                with self._image_lock:
+                    self._latest_image_jpeg = jpeg_bytes
+                    self._latest_image_meta = image_meta
+            new_snapshot["latest_processed_image"] = image_meta
+        else:
+            with self._image_lock:
+                 new_snapshot["latest_processed_image"] = self._latest_image_meta if self._latest_image_meta else {"status": "No data"}
 
-                elif mode == "queue_latest":
-                    q = self.data_bus.get_or_create(databus_key, lambda: queue.Queue())
-                    item = get_latest_from_queue(q)
-                    new_snapshot[snapshot_key] = item
-
-                elif mode == "queue_latest_image":
-                    q = self.data_bus.get_or_create(databus_key, lambda: queue.Queue())
-                    frame = get_latest_from_queue(q)
-                    meta: Dict[str, Any] = {
-                        "available": False,
-                        "last_update": None,
-                        "error": None,
-                    }
-
-                    if frame is not None and cv2 is not None:
-                        try:
-                            ok, buf = cv2.imencode(".jpg", frame)
-                            if ok:
-                                jpeg_bytes = buf.tobytes()
-                                with self._image_lock:
-                                    self._latest_image_jpeg = jpeg_bytes
-                                    self._latest_image_ts = time.time()
-                                meta["available"] = True
-                                meta["last_update"] = self._latest_image_ts
-                            else:
-                                meta["error"] = "jpeg_encode_failed"
-                        except Exception as e:
-                            meta["error"] = f"encode_exception: {e}"
-                    elif frame is not None and cv2 is None:
-                        meta["error"] = "cv2_not_available"
-
-                    new_snapshot[snapshot_key] = meta
-
-                else:
-                    new_snapshot[snapshot_key] = {
-                        "error": f"unknown_mode:{mode}",
-                    }
-            except Exception as e:
-                new_snapshot[snapshot_key] = {
-                    "error": f"exception:{e}",
-                }
-
-        # Atomically swap snapshot
         with self._snapshot_lock:
             self._snapshot = new_snapshot
 
     def get_snapshot(self) -> Dict[str, Any]:
-        """
-        Return a shallow copy of the current snapshot for HTTP handlers.
-        """
         with self._snapshot_lock:
             return dict(self._snapshot)
 
-    def get_latest_image(self) -> Tuple[Optional[bytes], Optional[float]]:
-        """
-        Return the latest encoded JPEG bytes and timestamp.
-        """
+    def get_latest_image_data(self) -> Tuple[Optional[bytes], Dict[str, Any]]:
         with self._image_lock:
-            return self._latest_image_jpeg, self._latest_image_ts
+            return self._latest_image_jpeg, dict(self._latest_image_meta)
 
     # ------------------------------------------------------------------ #
-    # Response helpers
+    # Utilities
     # ------------------------------------------------------------------ #
 
-    def _json_response(self, payload: Dict[str, Any], status: int = 200) -> Any:
-        """
-        Helper to jsonify with custom default and status code.
-        """
-        # Use json.dumps to respect our json_default, then wrap with Response
+    def _json_response(self, payload: Dict[str, Any], status: int = 200) -> Response:
         body = json.dumps(payload, default=json_default)
-        resp = Response(body, status=status, mimetype="application/json")
-        return resp
+        return Response(body, status=status, mimetype="application/json")
+        
+    def _generate_jpeg(self, frame: np.ndarray) -> Optional[bytes]:
+        if cv2 is None: return None
+        # Assuming frame is BGR
+        encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), 90]
+        try:
+            _, jpeg_buffer = cv2.imencode('.jpg', frame, encode_param)
+            return jpeg_buffer.tobytes()
+        except Exception as e:
+            print(f"[{self.name}] JPEG Error: {e}")
+            return None
+
+    # ------------------------------------------------------------------ #
+    # Routes
+    # ------------------------------------------------------------------ #
+
+    def _handle_status(self) -> Response:
+        snapshot = self.get_snapshot()
+        snapshot["server_timestamp"] = time.time()
+        return self._json_response(snapshot)
+
+    def _handle_image(self) -> Response:
+        jpeg_bytes, _ = self.get_latest_image_data()
+        if jpeg_bytes is None:
+            return self._json_response({"error": "No image data"}, status=503)
+        return Response(jpeg_bytes, status=200, mimetype="image/jpeg")
+
+    def _handle_stream(self) -> Response:
+        def generate():
+            while not self.should_stop():
+                jpeg_bytes, _ = self.get_latest_image_data()
+                if jpeg_bytes:
+                    yield (b'--frame\r\n'
+                           b'Content-Type: image/jpeg\r\n\r\n' + jpeg_bytes + b'\r\n')
+                time.sleep(0.05) # ~20 FPS cap
+        return Response(generate(), mimetype='multipart/x-mixed-replace; boundary=frame')
+    
+    def _handle_home(self) -> Response:
+        """
+        Dashboard Home:
+        - Displays /stream (Video)
+        - Displays /status (JSON) updated via JavaScript
+        """
+        html = f"""
+        <!DOCTYPE html>
+        <html lang="en">
+        <head>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <title>DRID System Dashboard</title>
+            <style>
+                body {{
+                    font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+                    background-color: #f4f4f9;
+                    color: #333;
+                    margin: 0;
+                    padding: 20px;
+                    transition: background-color 0.5s ease;
+                }}
+                h1 {{ margin-bottom: 20px; }}
+                
+                .dashboard-container {{
+                    display: flex;
+                    flex-wrap: wrap;
+                    gap: 20px;
+                    align-items: flex-start;
+                }}
+                
+                /* Video Section */
+                .video-card {{
+                    background: white;
+                    padding: 10px;
+                    border-radius: 8px;
+                    box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+                    flex: 1 1 640px; /* Grow/Shrink with base width 640 */
+                    max-width: 100%;
+                }}
+                .video-card img {{
+                    width: 100%;
+                    height: auto;
+                    border-radius: 4px;
+                    display: block;
+                }}
+
+                /* Status Section */
+                .status-card {{
+                    background: white;
+                    padding: 20px;
+                    border-radius: 8px;
+                    box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+                    flex: 1 1 400px;
+                    max-height: 80vh;
+                    overflow-y: auto;
+                }}
+                pre {{
+                    background: #2d2d2d;
+                    color: #76e068;
+                    padding: 15px;
+                    border-radius: 5px;
+                    font-size: 13px;
+                    overflow-x: auto;
+                    white-space: pre-wrap; /* Wrap long lines */
+                }}
+
+                /* Dynamic State Classes */
+                .state-deterrence {{
+                    background-color: #ff0000 !important; 
+                    color: white !important;              
+                    transition: background-color 0.1s;
+                }}
+            </style>
+        </head>
+        <body id="body-el">
+            <h1>DRID System Dashboard</h1>
+            
+            <div class="dashboard-container">
+                <div class="video-card">
+                    <h3>Live Camera Stream</h3>
+                    <img src="/stream" alt="Waiting for stream...">
+                </div>
+
+                <div class="status-card">
+                    <h3>System Telemetry (Live)</h3>
+                    <div id="connection-status" style="font-size: 0.8em; color: gray; margin-bottom: 5px;">Connecting...</div>
+                    <pre id="json-display">Loading data...</pre>
+                </div>
+            </div>
+
+            <script>
+                const statusUrl = "/status";
+                const jsonDisplay = document.getElementById('json-display');
+                const bodyEl = document.getElementById('body-el');
+                const connStatus = document.getElementById('connection-status');
+                
+                // Function to update the dashboard
+                async function updateDashboard() {{
+                    try {{
+                        const response = await fetch(statusUrl);
+                        if (!response.ok) throw new Error('Network response was not ok');
+                        
+                        const data = await response.json();
+                        
+                        // 1. Update JSON Text
+                        jsonDisplay.textContent = JSON.stringify(data, null, 2);
+                        
+                        // 2. Visual Warning if Deterrence is active
+                        // Checks if 'deter_flag' exists and is true
+                        if (data.deter_flag === true) {{
+                            bodyEl.classList.add('state-deterrence');
+                        }} else {{
+                            bodyEl.classList.remove('state-deterrence');
+                        }}
+
+                        connStatus.textContent = "Last Updated: " + new Date().toLocaleTimeString();
+                        connStatus.style.color = "green";
+
+                    }} catch (error) {{
+                        console.error('Fetch error:', error);
+                        connStatus.textContent = "Connection Lost. Retrying...";
+                        connStatus.style.color = "red";
+                    }}
+                }}
+
+                // Update every 500ms (2 FPS for data)
+                setInterval(updateDashboard, 500);
+                
+                // Initial call
+                updateDashboard();
+            </script>
+        </body>
+        </html>
+        """
+        return Response(html, mimetype='text/html')

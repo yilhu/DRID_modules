@@ -4,27 +4,11 @@ data_bus.py
 Thread-safe shared data hub for the detection unit on Raspberry Pi.
 
 Core responsibilities:
-    - Own and expose the main shared queues:
-        * image_queue            : raw frames (read_camera.py -> yolo_detector.py)
-        * detect_queue           : detection results (yolo_detector.py -> decision_logic.py / logger.py / lora_comm.py / http_server.py)
-        * processed_image_queue  : processed / annotated frames for UI / HTTP
-        * error_log              : structured error entries for logger / watchdog
-
-    - Provide generic queue helpers (for both core and module-specific queues):
-        * queue_put(...)
-        * queue_get(...)
-        * drain_queue(...)
-        * get_latest_from_queue(...)
-
-    - Provide a single semantic helper that keeps detection and processed-image
-      queues aligned:
-        * push_detection_with_image(...)
-
-    - Maintain shared state:
-        * motor_location (dict)
-        * deter_flag (bool)
-        * generic registry for module-specific resources
-        * per-module health info and snapshots for watchdog / http_server
+    - Own and expose the main shared queues (excluding processed_image_queue, now a state).
+    - Provide generic queue helpers.
+    - Provide a single semantic helper (push_detection_with_image) that updates the registry.
+    - Maintain ALL shared state (including latest processed image) in a unified, thread-safe registry.
+    - Provide a thread-safe state change notification mechanism (using Condition).
 """
 
 from __future__ import annotations
@@ -33,7 +17,7 @@ import queue
 import threading
 import time
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, Optional, List
+from typing import Any, Callable, Dict, Optional, List, Tuple
 
 
 # ---------------------------------------------------------------------------
@@ -53,9 +37,7 @@ class ProcessedImageItem:
     """
     Processed image produced by yolo_detector.py.
 
-    This item includes both the annotated frame and the detection data so that
-    http_server (and other UI modules) can display bounding boxes and labels
-    without touching detect_queue, which is reserved for decision_logic.
+    This item includes both the annotated frame and the detection data.
     """
     frame: Any              # processed / annotated frame
     boxes: Any              # list/array of bounding boxes
@@ -86,49 +68,84 @@ class ErrorEntry:
 
 
 # ---------------------------------------------------------------------------
+# Configuration Definition (Simplified structure for demonstration)
+# ---------------------------------------------------------------------------
+
+DEFAULT_CONFIG_STRUCTURE = {
+    # --- ReadCamera Configuration ---
+    "camera_device_index": 0,
+    "camera_req_width": None,
+    "camera_req_height": None,
+    "camera_period_s": 0.0,
+    "camera_fourcc": None,
+    "camera_buffer_size": 1,
+    "camera_max_consecutive_fail": 5, # From BaseModule
+
+    # --- YoloDetector Configuration ---
+    "yolo_model_weights_path": "/default/path/to/model",
+    "yolo_input_img_size": 640,
+    "yolo_conf_threshold": 0.25,
+    "yolo_iou_threshold": 0.45,
+    "yolo_bgr_to_rgb_conversion": False,
+    "yolo_queue_timeout_s": 0.1,
+    "yolo_max_consecutive_fail": 5, # From BaseModule
+
+    # --- HttpServerModule Configuration ---
+    "http_server_host": "127.0.0.1",
+    "http_server_port": 5000,
+    "http_server_poll_interval": 1.0,
+    # Export config is complex; using a simplified list of keys for demonstration
+    "http_server_export_config_keys": ["motor_location", "deter_flag"], 
+    "http_server_max_consecutive_fail": 5, # From BaseModule
+}
+
+
+# ---------------------------------------------------------------------------
 # Core DataBus class
 # ---------------------------------------------------------------------------
 
 class DataBus:
     """
-    Central hub for all shared data.
-
-    One DataBus instance should be created in main.py and passed to all modules.
-    Modules are expected to:
-        - use the exposed queues directly (image_queue, detect_queue, etc.),
-        - use the generic queue helpers for consistent behaviour,
-        - optionally use push_detection_with_image() when they need detection
-          and processed-image queues to stay aligned.
+    Central hub for all shared data, state, and resources.
     """
 
     def __init__(
         self,
+        config_override: Optional[Dict[str, Any]] = None,
         image_queue_size: int = 3,
         detect_queue_size: int = 20,
-        processed_image_queue_size: int = 20,
+        # [REMOVED] processed_image_queue_size argument is no longer needed.
         error_queue_size: int = 200,
     ) -> None:
         # Bounded queues for streaming data
         self.image_queue: queue.Queue = queue.Queue(maxsize=image_queue_size)
         self.detect_queue: queue.Queue = queue.Queue(maxsize=detect_queue_size)
-        self.processed_image_queue: queue.Queue = queue.Queue(
-            maxsize=processed_image_queue_size
-        )
+        # [REMOVED] self.processed_image_queue definition is removed.
         self.error_log: queue.Queue = queue.Queue(maxsize=error_queue_size)
 
-        # Motor state
-        self._motor_location_lock = threading.Lock()
-        self._motor_location: Dict[str, Any] = {}
-
-        # Global deterrence flag
-        self._deter_flag_lock = threading.Lock()
-        self._deter_flag: bool = False
-
-        # Generic key-value registry for module-specific resources
+        # ------------------------------------------------------------------
+        # Unified Registry for ALL Shared State and Module Resources
+        # ------------------------------------------------------------------
         self._registry_lock = threading.Lock()
         self._registry: Dict[str, Any] = {}
+        
+        # Condition variable for state change notifications
+        self._state_condition = threading.Condition(self._registry_lock) 
 
+        # 1. Initialize 'config' as a core state attribute, allowing overrides
+        initial_config = dict(DEFAULT_CONFIG_STRUCTURE)
+        if config_override:
+            initial_config.update(config_override)
+        self.set_state("config", initial_config)
+        
+        # 2. Initialize core dynamic states 
+        self.set_state("motor_location", {})
+        self.set_state("deter_flag", False)
+        # [NEW] Initialize the registry key for the latest processed image snapshot
+        self.set_state("latest_processed_image_item", None)
+        
         # Lock for pushing detection + processed image together
+        # Note: This lock now only protects the detect_queue put operation.
         self._det_proc_lock = threading.Lock()
 
         # Per-module health (for watchdog/http_server)
@@ -136,7 +153,7 @@ class DataBus:
         self._module_health: Dict[str, Dict[str, Any]] = {}
 
     # ------------------------------------------------------------------
-    # Generic queue helpers (public, for core + private queues)
+    # Generic queue helpers
     # ------------------------------------------------------------------
 
     def queue_put(
@@ -146,24 +163,15 @@ class DataBus:
         drop_oldest_if_full: bool = False,
     ) -> None:
         """
-        Put an item into a queue (bounded or unbounded).
-
-        - If q.maxsize == 0 (unbounded), this simply calls q.put(item).
-        - If q.maxsize > 0 (bounded):
-            * When drop_oldest_if_full is False, q.put(item) may block until
-              space is available.
-            * When drop_oldest_if_full is True and the queue is full, the
-              oldest item is removed with get_nowait() before putting the
-              new one, so this call will not block due to a full queue.
+        Put an item into a queue. If bounded and drop_oldest_if_full is True,
+        it non-blockingly removes the oldest item if the queue is full.
         """
-        # For unbounded queues, q.full() is always False.
         if drop_oldest_if_full and q.maxsize > 0 and q.full():
             try:
                 q.get_nowait()
             except queue.Empty:
                 # Race condition; safe to ignore.
                 pass
-
         q.put(item)
 
     def queue_get(
@@ -173,16 +181,7 @@ class DataBus:
     ) -> Optional[Any]:
         """
         Get the next (oldest) item from a queue (FIFO semantics).
-
-        timeout:
-            None  -> block indefinitely until an item is available
-            0     -> non-blocking; return None if empty
-            >0    -> block up to timeout seconds
-
-        Returns:
-            - The item if successful.
-            - None if the queue is empty and timeout expired (or immediately
-              when timeout == 0).
+        Returns None if timeout expires.
         """
         try:
             if timeout is None:
@@ -200,11 +199,7 @@ class DataBus:
         max_items: Optional[int] = None,
     ) -> List[Any]:
         """
-        Non-blocking drain of a queue.
-
-        - Repeatedly calls get_nowait() until the queue is empty or
-          max_items (if provided) is reached.
-        - Returns a list of items (possibly empty).
+        Non-blocking drain of a queue. Returns a list of items.
         """
         items: List[Any] = []
         while max_items is None or len(items) < max_items:
@@ -218,12 +213,8 @@ class DataBus:
     def get_latest_from_queue(self, q: queue.Queue) -> Optional[Any]:
         """
         Non-blocking helper that returns the last available item in a queue.
-
-        - Repeatedly calls get_nowait() until the queue is empty.
-        - Returns the last item retrieved, or None if the queue was empty.
-
-        Use this for UI modules that only care about the most recent state
-        (e.g. last processed frame), not the full history.
+        Used for UI modules that only care about the most recent state.
+        (Retained for image_queue/error_log usage, but not for processed images).
         """
         latest: Any = None
         got_any = False
@@ -250,19 +241,8 @@ class DataBus:
         drop_oldest_if_full: bool = False,
     ) -> None:
         """
-        Convenience method for yolo_detector.py.
-
-        Push a detection result and its corresponding processed frame so
-        that items in detect_queue and processed_image_queue refer to
-        the same logical frame (same timestamp + meta).
-
-        processed_image_queue carries copies of detection data so that
-        http_server can display bounding boxes / labels without consuming
-        detect_queue.
-
-        This is the only semantic helper that couples two queues; all other
-        type-specific push/get logic is expected to live in the respective
-        modules.
+        Push a detection result to detect_queue AND store the corresponding 
+        processed frame item as the latest state snapshot in the registry.
         """
         if meta is None:
             meta = {}
@@ -286,59 +266,72 @@ class DataBus:
         )
 
         with self._det_proc_lock:
+            # 1. Push Detection Item to queue (for Decision Logic module)
             self.queue_put(
                 self.detect_queue,
                 det_item,
                 drop_oldest_if_full=drop_oldest_if_full,
             )
-            self.queue_put(
-                self.processed_image_queue,
-                img_item,
-                drop_oldest_if_full=drop_oldest_if_full,
-            )
+            # [REMOVED] The queue_put for self.processed_image_queue is removed.
+
+        # 2. Store Processed Image Item in Registry (for Logger and HTTP Server)
+        # This guarantees access to the latest item without queue contention.
+        self.set_state("latest_processed_image_item", img_item)
 
     # ------------------------------------------------------------------
-    # Motor location API
+    # Unified State API
     # ------------------------------------------------------------------
 
-    def set_motor_location(self, **kwargs: Any) -> None:
+    def set_state(self, key: str, value: Any) -> None:
         """
-        Update the motor location/state.
+        Set a generic shared state key's value. Thread-safe.
+        Notifies listeners if the 'deter_flag' is set to True.
+        """
+        with self._registry_lock:
+            old_value = self._registry.get(key)
+            self._registry[key] = value
+            
+            # Notify listeners if 'deter_flag' changes to True.
+            if key == "deter_flag" and value and old_value != value:
+                self._state_condition.notify_all()
 
-        Example:
-            data_bus.set_motor_location(
-                angle=theta,
-                x=current_x,
-                y=current_y,
-            )
+    def get_state(self, key: str, default: Any = None) -> Any:
         """
-        with self._motor_location_lock:
-            self._motor_location.update(kwargs)
+        Get a generic shared state key's value. Thread-safe.
+        Returns a copy of mutable objects (dict/list) if the key exists.
+        """
+        with self._registry_lock:
+            value = self._registry.get(key, default)
+            
+            if key in self._registry:
+                # Return a copy of mutable objects (e.g., motor_location)
+                if isinstance(value, dict):
+                    return dict(value)
+                if isinstance(value, list):
+                    return list(value)
+                
+            return value
 
-    def get_motor_location(self) -> Dict[str, Any]:
+    def update_state(self, key: str, **kwargs: Any) -> None:
         """
-        Return a copy of the current motor location/state.
+        Atomically update a dictionary-like state item (e.g., 'motor_location').
         """
-        with self._motor_location_lock:
-            return dict(self._motor_location)
+        with self._registry_lock:
+            current_state = self._registry.setdefault(key, {})
+            if isinstance(current_state, dict):
+                current_state.update(kwargs)
+            else:
+                raise TypeError(f"State key '{key}' is not a dictionary and cannot be updated with kwargs.")
 
-    # ------------------------------------------------------------------
-    # Deterrence flag API
-    # ------------------------------------------------------------------
-
-    def set_deter_flag(self, value: bool) -> None:
+    # [NEW] State change waiting mechanism
+    def wait_for_state_change(self, timeout: float) -> None:
         """
-        Set the global deterrence flag.
+        Wait until a state change notification (currently only deter_flag=True) is 
+        received or the timeout expires.
         """
-        with self._deter_flag_lock:
-            self._deter_flag = bool(value)
-
-    def get_deter_flag(self) -> bool:
-        """
-        Read the global deterrence flag.
-        """
-        with self._deter_flag_lock:
-            return self._deter_flag
+        with self._state_condition:
+            # wait() releases the lock and blocks until notified or timeout
+            self._state_condition.wait(timeout=timeout)
 
     # ------------------------------------------------------------------
     # Generic registry for module-specific resources
@@ -347,15 +340,7 @@ class DataBus:
     def get_or_create(self, key: str, factory: Callable[[], Any]) -> Any:
         """
         Get a resource by key from the internal registry, creating it on the
-        first access with the given factory.
-
-        Intended usage:
-            tx_q = data_bus.get_or_create(
-                "lora.tx_queue",
-                lambda: queue.Queue(maxsize=10)
-            )
-
-        This method is thread-safe.
+        first access with the given factory. Thread-safe.
         """
         with self._registry_lock:
             if key not in self._registry:
@@ -364,14 +349,14 @@ class DataBus:
 
     def has_key(self, key: str) -> bool:
         """
-        Check if a key exists in the registry.
+        Check if a key exists in the registry (state or resource). Thread-safe.
         """
         with self._registry_lock:
             return key in self._registry
 
     def registry_keys(self) -> List[str]:
         """
-        Return a list of all registry keys (for debugging / watchdog).
+        Return a list of all registry keys (for debugging / watchdog). Thread-safe.
         """
         with self._registry_lock:
             return list(self._registry.keys())
@@ -382,10 +367,7 @@ class DataBus:
 
     def update_module_health(self, module: str, **fields: Any) -> None:
         """
-        Update health information for a given module.
-
-        Typically called by watchdog.py after checking heartbeats,
-        step durations, exception counters, etc.
+        Update health information for a given module. Thread-safe.
         """
         with self._health_lock:
             h = self._module_health.setdefault(module, {})
@@ -393,7 +375,7 @@ class DataBus:
 
     def get_module_health_snapshot(self) -> Dict[str, Dict[str, Any]]:
         """
-        Return a snapshot of current module health info.
+        Return a snapshot of current module health info. Thread-safe.
         """
         with self._health_lock:
             return {m: dict(info) for m, info in self._module_health.items()}
@@ -404,25 +386,33 @@ class DataBus:
 
     def snapshot(self) -> Dict[str, Any]:
         """
-        Return a lightweight snapshot of core DataBus state.
-
-        Safe to call from watchdog.py / http_server.py for monitoring.
+        Return a lightweight snapshot of core DataBus state, including queue sizes
+        and key shared state items. Safe for monitoring.
         """
-        with self._motor_location_lock, self._deter_flag_lock:
-            snapshot = {
-                "motor_location": dict(self._motor_location),
-                "deter_flag": self._deter_flag,
-                "image_queue_size": self.image_queue.qsize(),
-                "detect_queue_size": self.detect_queue.qsize(),
-                "processed_image_queue_size": self.processed_image_queue.qsize(),
-                "error_log_size": self.error_log.qsize(),
-            }
+        snapshot = {
+            "image_queue_size": self.image_queue.qsize(),
+            "detect_queue_size": self.detect_queue.qsize(),
+            # [REMOVED] processed_image_queue_size removed
+            "error_log_size": self.error_log.qsize(),
+        }
+        
+        # Access unified registry for core state (config, motor, deter, image item)
         with self._registry_lock:
+            # Use get_state to correctly retrieve copies of complex objects
+            snapshot["motor_location"] = self.get_state("motor_location", {})
+            snapshot["deter_flag"] = self.get_state("deter_flag", False)
+            snapshot["latest_processed_image_item_exists"] = self.get_state("latest_processed_image_item", None) is not None
             snapshot["registry_keys"] = list(self._registry.keys())
+            
+            # Include config key list for inspection
+            config_dict = self._registry.get("config", {})
+            snapshot["config_keys"] = list(config_dict.keys())
+
         with self._health_lock:
             snapshot["module_health"] = {
                 m: dict(info) for m, info in self._module_health.items()
             }
+            
         return snapshot
 
 
@@ -432,4 +422,5 @@ __all__ = [
     "ProcessedImageItem",
     "DetectionItem",
     "ErrorEntry",
+    "DEFAULT_CONFIG_STRUCTURE",
 ]
